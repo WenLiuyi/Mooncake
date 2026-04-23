@@ -650,6 +650,18 @@ class Client {
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices);
+    void ApplyPreferredSegmentHintForWrite(ReplicateConfig& config,
+                                           const std::string& object_key,
+                                           bool is_batch_request = false);
+    void UpdateLearnedPreferredSegment(const std::string& object_key,
+                                       const Replica::Descriptor& replica);
+    std::optional<std::string> GetLearnedPreferredSegment(
+        const std::string& object_key) const;
+    struct LearnedHintState {
+        std::string endpoint;
+        uint32_t hit_count = 0;
+        std::chrono::steady_clock::time_point last_update;
+    };
 
     // Client identification
     const UUID client_id_;
@@ -670,6 +682,14 @@ class Client {
     const std::string local_hostname_;
     const std::string metadata_connstring_;
     const std::string protocol_;
+    const bool enable_online_hint_learning_{false};
+    const size_t online_hint_learning_capacity_{10000};
+    const uint32_t online_hint_min_hits_{1};
+    const uint64_t online_hint_ttl_ms_{60000};
+    const double laps_static_weight_{1.0};
+    const double laps_learned_weight_{2.0};
+    mutable std::mutex learned_preferred_segments_mutex_;
+    std::unordered_map<std::string, LearnedHintState> learned_preferred_segments_;
 
     // Client persistent thread pool for async operations
     // Pinned host memory pool for GPU D2H staging (must outlive

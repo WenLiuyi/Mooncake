@@ -51,6 +51,10 @@ using gpu_staging::SetDevice;
     return slice_size;
 }
 
+static uint32_t parse_uint_env(const char* key, uint32_t default_value);
+static uint64_t parse_u64_env(const char* key, uint64_t default_value);
+static double parse_double_env(const char* key, double default_value);
+
 Client::Client(const std::string& local_hostname,
                const std::string& metadata_connstring,
                const std::string& protocol,
@@ -62,6 +66,27 @@ Client::Client(const std::string& local_hostname,
       local_hostname_(local_hostname),
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
+      enable_online_hint_learning_(
+          []() {
+              const char* env = std::getenv("MC_MS_ONLINE_HINT_LEARNING");
+              return env && std::string(env) == "1";
+          }()),
+      online_hint_learning_capacity_(
+          []() {
+              const char* env =
+                  std::getenv("MC_MS_ONLINE_HINT_LEARNING_CAPACITY");
+              if (!env || *env == '\0') return static_cast<size_t>(10000);
+              try {
+                  return static_cast<size_t>(std::stoull(env));
+              } catch (...) {
+                  return static_cast<size_t>(10000);
+              }
+          }()),
+      online_hint_min_hits_(parse_uint_env("MC_MS_ONLINE_HINT_MIN_HITS", 1)),
+      online_hint_ttl_ms_(parse_u64_env("MC_MS_ONLINE_HINT_TTL_MS", 60000)),
+      laps_static_weight_(parse_double_env("MC_MS_LAPS_STATIC_WEIGHT", 1.0)),
+      laps_learned_weight_(
+          parse_double_env("MC_MS_LAPS_LEARNED_WEIGHT", 2.0)),
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       write_thread_pool_(2),
       task_thread_pool_(4) {
@@ -79,6 +104,16 @@ Client::Client(const std::string& local_hostname,
     } else {
         LOG(INFO) << "Client metrics disabled (set MC_STORE_CLIENT_METRIC=1 to "
                      "enable)";
+    }
+
+    if (enable_online_hint_learning_) {
+        LOG(INFO) << "Online preferred-segment learning enabled with capacity="
+                  << online_hint_learning_capacity_
+                  << " min_hits=" << online_hint_min_hits_
+                  << " ttl_ms=" << online_hint_ttl_ms_
+                  << " static_weight=" << laps_static_weight_
+                  << " learned_weight=" << laps_learned_weight_
+                  << " (MC_MS_ONLINE_HINT_LEARNING=1)";
     }
 }
 
@@ -187,6 +222,140 @@ static std::vector<std::string> get_auto_discover_filters() {
         }
     }
     return whitelst_filters;
+}
+
+static std::vector<std::string> get_preferred_segments_for_put_hint() {
+    const char* env = std::getenv("MC_MS_PREFERRED_SEGMENTS");
+    if (!env || *env == '\0') return {};
+
+    std::vector<std::string> segments =
+        splitString(env, ',', /*skip_empty=*/true);
+    for (auto& seg : segments) {
+        ltrim(seg);
+        rtrim(seg);
+    }
+    segments.erase(
+        std::remove_if(segments.begin(), segments.end(),
+                       [](const std::string& s) { return s.empty(); }),
+        segments.end());
+    return segments;
+}
+
+static uint32_t parse_uint_env(const char* key, uint32_t default_value) {
+    const char* env = std::getenv(key);
+    if (!env || *env == '\0') return default_value;
+    try {
+        return static_cast<uint32_t>(std::stoul(env));
+    } catch (...) {
+        return default_value;
+    }
+}
+
+static uint64_t parse_u64_env(const char* key, uint64_t default_value) {
+    const char* env = std::getenv(key);
+    if (!env || *env == '\0') return default_value;
+    try {
+        return static_cast<uint64_t>(std::stoull(env));
+    } catch (...) {
+        return default_value;
+    }
+}
+
+static double parse_double_env(const char* key, double default_value) {
+    const char* env = std::getenv(key);
+    if (!env || *env == '\0') return default_value;
+    try {
+        return std::stod(env);
+    } catch (...) {
+        return default_value;
+    }
+}
+
+void Client::ApplyPreferredSegmentHintForWrite(ReplicateConfig& config,
+                                               const std::string& object_key,
+                                               bool is_batch_request) {
+    // Keep explicit user-provided preference untouched.
+    if (!config.preferred_segment.empty() || !config.preferred_segments.empty())
+        return;
+
+    const auto preferred_segments = get_preferred_segments_for_put_hint();
+    auto learned = GetLearnedPreferredSegment(object_key);
+
+    // If static candidates are not configured, fallback to learned endpoint.
+    if (preferred_segments.empty()) {
+        if (learned) config.preferred_segment = learned.value();
+        return;
+    }
+
+    // Keep behavior predictable when list has only one candidate.
+    if (preferred_segments.size() == 1) {
+        config.preferred_segment = preferred_segments.front();
+        return;
+    }
+
+    // Batch put/upsert uses one ReplicateConfig for all keys. We hash the
+    // first key so that repeated runs remain deterministic without changing API.
+    if (is_batch_request && object_key.empty()) return;
+
+    const size_t static_idx =
+        std::hash<std::string>{}(object_key) % preferred_segments.size();
+    const auto& static_candidate = preferred_segments[static_idx];
+
+    // LAPS scoring: combine static affinity and learned affinity.
+    std::string best_segment = static_candidate;
+    double best_score = laps_static_weight_;
+    for (const auto& segment : preferred_segments) {
+        double score = 0.0;
+        if (segment == static_candidate) score += laps_static_weight_;
+        if (learned && segment == learned.value()) score += laps_learned_weight_;
+        if (score > best_score) {
+            best_score = score;
+            best_segment = segment;
+        }
+    }
+    config.preferred_segment = best_segment;
+}
+
+std::optional<std::string> Client::GetLearnedPreferredSegment(
+    const std::string& object_key) const {
+    if (!enable_online_hint_learning_ || object_key.empty()) return std::nullopt;
+    std::lock_guard<std::mutex> lock(learned_preferred_segments_mutex_);
+    auto it = learned_preferred_segments_.find(object_key);
+    if (it == learned_preferred_segments_.end()) return std::nullopt;
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                now - it->second.last_update)
+                                .count();
+    if (elapsed_ms > static_cast<long long>(online_hint_ttl_ms_)) {
+        return std::nullopt;
+    }
+    if (it->second.hit_count < online_hint_min_hits_) return std::nullopt;
+    return it->second.endpoint;
+}
+
+void Client::UpdateLearnedPreferredSegment(const std::string& object_key,
+                                           const Replica::Descriptor& replica) {
+    if (!enable_online_hint_learning_ || object_key.empty()) return;
+    if (!replica.is_memory_replica()) return;
+
+    const auto endpoint =
+        replica.get_memory_descriptor().buffer_descriptor.transport_endpoint_;
+    if (endpoint.empty()) return;
+
+    std::lock_guard<std::mutex> lock(learned_preferred_segments_mutex_);
+    if (learned_preferred_segments_.size() >= online_hint_learning_capacity_) {
+        // Bound memory usage with a simple random-ish eviction policy by
+        // removing one existing entry.
+        learned_preferred_segments_.erase(learned_preferred_segments_.begin());
+    }
+    auto& state = learned_preferred_segments_[object_key];
+    if (state.endpoint == endpoint) {
+        state.hit_count += 1;
+    } else {
+        state.endpoint = endpoint;
+        state.hit_count = 1;
+    }
+    state.last_update = std::chrono::steady_clock::now();
 }
 
 tl::expected<std::optional<ha::HABackendSpec>, ErrorCode> ParseHABackendSpec(
@@ -805,6 +974,8 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         return tl::unexpected(err);
     }
 
+    UpdateLearnedPreferredSegment(object_key, replica);
+
     // Frequency admission: only promote frequently accessed keys to hot cache.
     // Skip when cache_used — data was already served from local cache, no need
     // to re-promote or increment the CMS counter.
@@ -857,6 +1028,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         LOG(ERROR) << "transfer_read_range_failed key=" << object_key;
         return tl::unexpected(err);
     }
+    UpdateLearnedPreferredSegment(object_key, replica);
     if (query_result.IsLeaseExpired()) {
         LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
                      << object_key;
@@ -1182,6 +1354,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     ReplicateConfig client_cfg = config;
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
+    } else {
+        ApplyPreferredSegmentHintForWrite(client_cfg, key);
     }
 
     // Start put operation
@@ -1267,6 +1441,8 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     ReplicateConfig client_cfg = config;
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
+    } else {
+        ApplyPreferredSegmentHintForWrite(client_cfg, key);
     }
 
     // Start upsert operation
@@ -1341,6 +1517,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     ReplicateConfig client_cfg = config;
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
+    } else if (!keys.empty()) {
+        ApplyPreferredSegmentHintForWrite(client_cfg, keys.front(),
+                                          /*is_batch_request=*/true);
     }
     if (client_cfg.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported for upsert";
@@ -1995,6 +2174,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     ReplicateConfig client_cfg = config;
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
+    } else if (!keys.empty()) {
+        ApplyPreferredSegmentHintForWrite(client_cfg, keys.front(),
+                                          /*is_batch_request=*/true);
     }
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
     if (client_cfg.prefer_alloc_in_same_node) {
