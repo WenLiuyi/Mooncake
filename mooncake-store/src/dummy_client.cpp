@@ -117,17 +117,30 @@ std::vector<std::vector<uint64_t>> void_ptr_rows_to_u64_nested(
 
 namespace mooncake {
 
+template <auto ServiceMethod>
+constexpr bool can_invoke_when_disconnected() {
+    using Method = std::remove_reference_t<decltype(ServiceMethod)>;
+    return std::is_same_v<
+               Method, std::remove_reference_t<decltype(&RealClient::ping)>> ||
+           std::is_same_v<Method,
+                          std::remove_reference_t<
+                              decltype(&RealClient::service_ready_internal)>> ||
+           std::is_same_v<Method,
+                          std::remove_reference_t<
+                              decltype(&RealClient::is_shm_mapped_internal)>> ||
+           std::is_same_v<Method,
+                          std::remove_reference_t<
+                              decltype(&RealClient::ascend_shm_internal)>> ||
+           std::is_same_v<Method,
+                          std::remove_reference_t<
+                              decltype(&RealClient::ascend_ipc_shm_internal)>>;
+}
+
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> DummyClient::invoke_rpc(Args&&... args) {
     auto pool = client_accessor_.GetClientPool();
 
-    if constexpr (!std::is_same_v<
-                      std::remove_reference_t<decltype(ServiceMethod)>,
-                      std::remove_reference_t<decltype(&RealClient::ping)>> &&
-                  !std::is_same_v<
-                      std::remove_reference_t<decltype(ServiceMethod)>,
-                      std::remove_reference_t<
-                          decltype(&RealClient::service_ready_internal)>>) {
+    if constexpr (!can_invoke_when_disconnected<ServiceMethod>()) {
         if (!connected_.load()) {
             LOG(ERROR) << "Dummy Client not connected";
             return tl::make_unexpected(ErrorCode::RPC_FAIL);
@@ -266,6 +279,20 @@ ErrorCode DummyClient::connect(const std::string& server_address) {
 int DummyClient::register_ascend_shm(const ShmHelper::ShmSegment* shm,
                                      bool is_local) {
 #ifdef USE_ASCEND_DIRECT
+    const auto dummy_base_addr = reinterpret_cast<uint64_t>(shm->base_addr);
+    auto mapped_result = invoke_rpc<&RealClient::is_shm_mapped_internal, bool>(
+        dummy_base_addr, client_id_);
+    if (!mapped_result.has_value()) {
+        LOG(WARNING) << "Failed to query real-side shared memory mapping, addr="
+                     << shm->base_addr;
+        return -1;
+    }
+    if (mapped_result.value()) {
+        LOG(INFO) << "Real-side shared memory mapping already exists, addr="
+                  << shm->base_addr << ", size=" << shm->size;
+        return 0;
+    }
+
     // Detect memory type: device memory uses IPC sharing
     aclrtPtrAttributes attributes;
     auto ret = aclrtPointerGetAttributes(shm->base_addr, &attributes);
@@ -288,8 +315,8 @@ int DummyClient::register_ascend_shm(const ShmHelper::ShmSegment* shm,
 
         std::string ipc_key_bytes(ipc_key, kIPCKeyLen);
         auto map_ret = invoke_rpc<&RealClient::ascend_ipc_shm_internal, void>(
-            reinterpret_cast<uint64_t>(shm->base_addr), shm->size, is_local,
-            ipc_key_bytes, device_id_, client_id_);
+            dummy_base_addr, shm->size, is_local, ipc_key_bytes, device_id_,
+            client_id_);
         if (!map_ret.has_value()) {
             LOG(ERROR) << "Failed to map IPC buffer on real side";
             return -1;
@@ -331,8 +358,8 @@ int DummyClient::register_ascend_shm(const ShmHelper::ShmSegment* shm,
     std::string handle_bytes(reinterpret_cast<char*>(&export_handle),
                              sizeof(export_handle));
     auto map_ret = invoke_rpc<&RealClient::ascend_shm_internal, void>(
-        reinterpret_cast<uint64_t>(shm->base_addr), shm->size, is_local,
-        handle_bytes, device_id_, client_id_);
+        dummy_base_addr, shm->size, is_local, handle_bytes, device_id_,
+        client_id_);
     if (!map_ret.has_value()) {
         LOG(ERROR) << "Failed to map VMM buffer on real side";
         return -1;
@@ -1013,15 +1040,18 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
     const std::vector<std::vector<std::string>>& all_keys,
     const std::vector<std::vector<std::vector<size_t>>>& all_dst_offsets,
     const std::vector<std::vector<std::vector<size_t>>>& all_src_offsets,
-    const std::vector<std::vector<std::vector<size_t>>>& all_sizes) {
+    const std::vector<std::vector<std::vector<size_t>>>& all_sizes,
+    const QueryResultCache* query_result_cache) {
     std::vector<uint64_t> dummy_buffers = void_ptrs_to_u64(buffers);
+    auto cached_query_results =
+        build_cached_query_results_from_query_result_cache(query_result_cache);
     const auto start_time = std::chrono::steady_clock::now();
     auto internal_results =
         invoke_rpc<&RealClient::get_into_ranges_shm_helper,
                    std::vector<std::vector<
                        std::vector<tl::expected<int64_t, ErrorCode>>>>>(
             dummy_buffers, all_keys, all_dst_offsets, all_src_offsets,
-            all_sizes, device_id_, client_id_);
+            all_sizes, cached_query_results, device_id_, client_id_);
 
     if (!internal_results) {
         LOG(ERROR) << "get_into_ranges RPC failed";
@@ -1034,6 +1064,39 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
     if (total_bytes > 0) {
         ObserveTransferMetric(TransferOperationKind::kRead, "get_into_ranges",
                               total_bytes, elapsed_us_since(start_time), true);
+    }
+    return results;
+}
+
+std::vector<tl::expected<QueryResult, ErrorCode>> DummyClient::batch_query(
+    const std::vector<std::string>& keys) {
+    auto cached_results =
+        invoke_rpc<&RealClient::batch_get_query_results,
+                   std::vector<CachedQueryResultResponse>>(keys);
+    if (!cached_results) {
+        return std::vector<tl::expected<QueryResult, ErrorCode>>(
+            keys.size(), tl::unexpected(cached_results.error()));
+    }
+    if (cached_results->size() != keys.size()) {
+        LOG(ERROR) << "BatchQuery response size mismatch: expected "
+                   << keys.size() << ", got " << cached_results->size();
+        return std::vector<tl::expected<QueryResult, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::RPC_FAIL));
+    }
+
+    std::vector<tl::expected<QueryResult, ErrorCode>> results;
+    results.reserve(keys.size());
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto& cached_result : *cached_results) {
+        if (!cached_result.success) {
+            results.emplace_back(tl::unexpected(cached_result.error));
+            continue;
+        }
+        results.emplace_back(QueryResult(
+            std::vector<Replica::Descriptor>(
+                cached_result.value.replicas.begin(),
+                cached_result.value.replicas.end()),
+            now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms)));
     }
     return results;
 }

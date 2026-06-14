@@ -6,6 +6,8 @@ Mooncake Store supports offloading KV cache objects from distributed memory to l
 
 SSD offload is implemented as a background subsystem within the **real client** process. It is transparent to the application: a `Put` that would otherwise be evicted from memory is persisted to disk, and a `Get` that finds no memory replica automatically falls back to reading from SSD.
 
+For multi-turn conversation benchmark results, see [Mooncake SSD Offload Benchmark](../performance/ssd-offload-benchmark-results.md).
+
 ---
 
 ## Architecture
@@ -242,4 +244,6 @@ To prevent `io_uring`'s `FOLL_LONGTERM` page pinning from failing on systems wit
 
 ## Metadata Recovery on Restart
 
-On startup, `FileStorage::Init` calls `StorageBackend::ScanMeta`, which reads all on-disk metadata and invokes a callback for each discovered object. The callback calls `MasterClient::NotifyOffloadSuccess` to re-register the objects with the master. This restores the full disk-replica view without any application-level intervention.
+On startup, `FileStorage::Init` calls `StorageBackend::ScanMeta`, which reads on-disk metadata and invokes a callback for each discovered object. The callback calls `MasterClient::NotifyOffloadSuccess` to re-register the objects with the master. This restores the full disk-replica view without any application-level intervention for the backends that preserve restart metadata, namely `BucketStorageBackend` and the file-per-key backend.
+
+`OffsetAllocatorStorageBackend` is the exception. It truncates its pre-allocated data file during initialization and clears its in-memory metadata, so previously offloaded objects are not recoverable after a real client restart.
